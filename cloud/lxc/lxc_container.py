@@ -601,6 +601,7 @@ class LxcContainerManagement(object):
         """
 
         # Remove incompatible storage backend options.
+        variables = variables.copy()
         for v in LXC_BACKING_STORE[self.module.params['backing_store']]:
             variables.pop(v, None)
 
@@ -713,13 +714,12 @@ class LxcContainerManagement(object):
                 self._container_startup()
                 self.container.freeze()
 
-    def _clone(self):
+    def _clone(self, count=0):
         """Clone a new LXC container from an existing container.
 
         This method will clone an existing container to a new container using
         the `clone_name` variable as the new container name. The method will
-        fail if the container that is being used as the "original" container
-        does not exist.
+        create a container if the container `name` does not exist.
 
         Note that cloning a container will ensure that the original container
         is "stopped" before the clone can be done. Because this operation can
@@ -730,54 +730,62 @@ class LxcContainerManagement(object):
         state.
         """
 
-        if not self._container_exists(name=self.container_name):
-            self.failure(
-                err='Container [ %s ] does not exist' % self.container_name,
-                rc=1,
-                msg="The container that you've requested be cloned does not"
-                    " exist. Please check your container name."
+        self.check_count(count=count, method='clone')
+        if self._container_exists(name=self.container_name):
+            # Ensure that the state of the original container is stopped
+            container_state = self._get_state()
+            if container_state != 'stopped':
+                self.state_change = True
+                self.container.stop()
+
+            build_command = [
+                self.module.get_bin_path('lxc-clone', True),
+            ]
+
+            build_command = self._add_variables(
+                variables_dict=self._get_vars(
+                    variables=LXC_COMMAND_MAP['clone']['variables']
+                ),
+                build_command=build_command
             )
 
-        # Ensure that the state of the original container is stopped
-        container_state = self._get_state()
-        if container_state != 'stopped':
-            self.state_change = True
-            self.container.stop()
+            # Load logging for the instance when creating it.
+            if self.module.params.get('clone_snapshot') in BOOLEANS_TRUE:
+                build_command.append('--snapshot')
 
-        # Check if the container needs to have an archive created.
-        self._check_archive()
+            rc, return_data, err = self._run_command(build_command)
+            if rc != 0:
+                message = "Failed executing lxc-clone."
+                self.failure(
+                    err=err, rc=rc, msg=message, command=' '.join(
+                        build_command
+                    )
+                )
+            else:
+                self.state_change = True
+                # Restore the original state of the origin container if it was
+                # not in a stopped state.
+                if container_state == 'running':
+                    self.container.start()
+                elif container_state == 'frozen':
+                    self.container.start()
+                    self.container.freeze()
 
-        build_command = [
-            self.module.get_bin_path('lxc-clone', True),
-        ]
+            # Change the container name context to the new cloned container
+            self.container_name = self.module.params['clone_name']
 
-        build_command = self._add_variables(
-            variables_dict=self._get_vars(
-                variables=LXC_COMMAND_MAP['clone']['variables']
-            ),
-            build_command=build_command
-        )
+            # Return data
+            self._execute_command()
 
-        # Load logging for the instance when creating it.
-        if self.module.params.get('clone_snapshot') in BOOLEANS_TRUE:
-            build_command.append('--snapshot')
+            # Perform any configuration updates
+            self._config()
 
-        rc, return_data, err = self._run_command(build_command)
-        if rc != 0:
-            message = "Failed executing lxc-clone."
-            self.failure(
-                err=err, rc=rc, msg=message, command=' '.join(build_command)
-            )
+            # Check if the container needs to have an archive created.
+            self._check_archive()
         else:
-            # Restore the original state of the origin container if it was not
-            # in a stopped state.
-            if container_state == 'running':
-                self.container.start()
-            elif container_state == 'frozen':
-                self.container.start()
-                self.container.freeze()
-
-            self.state_change = True
+            self._create()
+            count += 1
+            self._clone(count)
 
     def _create(self):
         """Create a new LXC container.
